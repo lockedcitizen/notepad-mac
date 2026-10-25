@@ -1,0 +1,88 @@
+name: Nextpad++ Big Sur compatibility build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - nextpadpp-big-sur-build
+    paths:
+      - .github/workflows/nextpadpp-big-sur-build.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Intel runner; CMake will compile an x86_64 app targeting macOS 11.
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - name: Check out Nextpad++ v1.1.1
+        uses: actions/checkout@v4
+        with:
+          repository: nextpad-plus-plus/nextpad-plus-plus-macos
+          ref: v1.1.1
+          path: nextpadpp
+
+      - name: Install CMake
+        run: |
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          cmake --version
+          xcodebuild -version
+
+      - name: Configure for Intel and macOS 11
+        working-directory: nextpadpp
+        run: |
+          cmake -S . -B build-big-sur -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64
+
+      - name: Build
+        working-directory: nextpadpp
+        run: cmake --build build-big-sur --config Release --parallel 3
+
+      - name: Prepare app and audit binary minimums
+        working-directory: nextpadpp
+        run: |
+          APP="build-big-sur/Nextpad++.app"
+          test -d "$APP"
+          /usr/libexec/PlistBuddy -c 'Set :LSMinimumSystemVersion 11.0' "$APP/Contents/Info.plist" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c 'Add :LSMinimumSystemVersion string 11.0' "$APP/Contents/Info.plist"
+          xattr -cr "$APP"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+
+          mkdir -p audit
+          {
+            echo "App bundle: $APP"
+            /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist" || true
+            find "$APP/Contents" -type f -print0 | while IFS= read -r -d '' f; do
+              if file "$f" | grep -q 'Mach-O'; then
+                echo "===== $f"
+                file "$f"
+                otool -l "$f" | grep -A 5 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' || true
+                otool -L "$f" || true
+              fi
+            done
+          } > audit/macos-compatibility-audit.txt
+          cat audit/macos-compatibility-audit.txt
+
+      - name: Package DMG
+        working-directory: nextpadpp
+        run: |
+          mkdir -p stage
+          ditto build-big-sur/Nextpad++.app stage/Nextpad++.app
+          ln -s /Applications stage/Applications
+          hdiutil create -volname "Nextpad++ Big Sur Experimental" \
+            -srcfolder stage -ov -format UDZO \
+            NextpadPlusPlus-v1.1.1-BigSur-experimental.dmg
+
+      - name: Upload DMG and audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: NextpadPlusPlus-v1.1.1-BigSur-experimental
+          path: |
+            nextpadpp/NextpadPlusPlus-v1.1.1-BigSur-experimental.dmg
+            nextpadpp/audit/macos-compatibility-audit.txt
+          if-no-files-found: error
+          retention-days: 14
